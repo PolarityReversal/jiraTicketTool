@@ -91,6 +91,9 @@ def resolve_mentions(text, jira):
     return re.sub(r"\[~accountid:([^\]]+)\]", lambda m: "@" + get_display_name(m.group(1), jira), text)
 
 def connect_jira(url, user, token):
+    if not url or not user or not token:
+        messagebox.showerror("Input Error", "Please input URL, username, and token.")
+        return None
     try:
         jira = JIRA(server=url, basic_auth=(user, token))
         return jira
@@ -141,6 +144,7 @@ class JiraUI(tk.Tk):
         self.geometry("900x700")
         self.current_page = 1
         self.tickets = []
+        self.displayed_tickets = []  # Sorted order to match listbox
         self.jira = None
         self.locked_tickets = load_locked_tickets()
 
@@ -207,7 +211,7 @@ class JiraUI(tk.Tk):
         self.text_display.tag_configure("header", font=("Helvetica", 14, "bold"))
         self.text_display.tag_configure("normal", font=("Helvetica", 12))
 
-        # On startup, ensure locked tickets remain in the list
+        # On startup, add dummy tickets for locked ones if not already in list
         if self.locked_tickets:
             for key in self.locked_tickets:
                 if not any(getattr(ticket, "key", "") == key for ticket in self.tickets):
@@ -215,14 +219,14 @@ class JiraUI(tk.Tk):
                     dummy = Dummy()
                     dummy.key = key
                     self.tickets.append(dummy)
-            self.update_ticket_list_display()
+        self.update_ticket_list_display()
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def update_lock_button_state(self, *args):
         self.btn_lock_selected.config(state=tk.NORMAL)
 
-    def update_ticket_list_display(self):
+    def sort_tickets_for_display(self):
         def sort_key(ticket):
             try:
                 prefix, num = ticket.key.split("-")
@@ -232,15 +236,21 @@ class JiraUI(tk.Tk):
                 num = 0
             locked_flag = 0 if ticket.key in self.locked_tickets else 1
             return (locked_flag, prefix, -num)
-        sorted_tickets = sorted(self.tickets, key=sort_key)
+        return sorted(self.tickets, key=sort_key)
+
+    def update_ticket_list_display(self):
+        self.displayed_tickets = self.sort_tickets_for_display()
         self.ticket_list.delete(0, tk.END)
-        for ticket in sorted_tickets:
+        for ticket in self.displayed_tickets:
             display_key = ticket.key
             if ticket.key in self.locked_tickets and not display_key.endswith("*"):
                 display_key += "*"
             self.ticket_list.insert(tk.END, display_key)
 
     def fetch_tickets(self):
+        if not self.entry_url.get().strip() or not self.entry_user.get().strip() or not self.entry_token.get().strip():
+            messagebox.showerror("Input Error", "Please input URL, username, and token.")
+            return
         url = self.entry_url.get().strip()
         user = self.entry_user.get().strip()
         token = self.entry_token.get().strip()
@@ -251,7 +261,6 @@ class JiraUI(tk.Tk):
         start_at = (self.current_page - 1) * 10
         new_tickets = get_recent_tickets(self.jira, start_at=start_at, max_results=10)
         if self.current_page == 1:
-            # Preserve already locked tickets
             locked_list = [ticket for ticket in self.tickets if getattr(ticket, "key", "") in self.locked_tickets]
             self.tickets = locked_list
         if new_tickets:
@@ -264,15 +273,50 @@ class JiraUI(tk.Tk):
             messagebox.showinfo("Info", "No more tickets available.")
         self.update_ticket_list_display()
 
-    def on_ticket_select(self, event):
-        if not self.tickets:
+    def search_ticket_action(self):
+        if not self.entry_url.get().strip() or not self.entry_user.get().strip() or not self.entry_token.get().strip():
+            messagebox.showerror("Input Error", "Please input URL, username, and token.")
             return
+        if not self.jira:
+            url = self.entry_url.get().strip()
+            user = self.entry_user.get().strip()
+            token = self.entry_token.get().strip()
+            self.jira = connect_jira(url, user, token)
+            if not self.jira:
+                return
+
+        search_input = self.entry_search.get().strip()
+        if not search_input:
+            messagebox.showwarning("Warning", "Please enter ticket number(s) to search.")
+            return
+
+        results = search_tickets(self.jira, search_input)
+        if not results:
+            messagebox.showinfo("Info", "No tickets found matching the search criteria.")
+            return
+
+        locked_dict = {ticket.key: ticket for ticket in self.tickets if getattr(ticket, "key", "") in self.locked_tickets}
+        for ticket in results:
+            locked_dict[ticket.key] = ticket
+        merged = list(locked_dict.values())
+        merged_keys = set(ticket.key for ticket in merged)
+        for ticket in results:
+            if ticket.key not in merged_keys:
+                merged.append(ticket)
+        self.tickets = merged
+        self.update_ticket_list_display()
+        self.text_display.delete(1.0, tk.END)
+        self.text_display.insert(tk.END, f"Found {len(self.tickets)} ticket(s).\n", "header")
+
+    def on_ticket_select(self, event):
         selection = self.ticket_list.curselection()
         if not selection:
             return
         index = selection[0]
-        ticket = self.tickets[index]
-        # For locked tickets, force reconnection using current token (even if self.jira is set)
+        if index < 0 or index >= len(self.displayed_tickets):
+            return
+        ticket = self.displayed_tickets[index]
+        # For locked tickets, always reconnect using current token
         if ticket.key in self.locked_tickets:
             url = self.entry_url.get().strip()
             user = self.entry_user.get().strip()
@@ -281,18 +325,18 @@ class JiraUI(tk.Tk):
             if not self.jira:
                 messagebox.showerror("Error", f"Unable to connect to JIRA, cannot load ticket {ticket.key}")
                 return
-        # If ticket is a dummy (lacks full fields), reload it
         if not hasattr(ticket, "fields"):
             try:
-                ticket = self.jira.issue(ticket.key)
-                for i, t in enumerate(self.tickets):
-                    if getattr(t, "key", "") == ticket.key:
-                        self.tickets[i] = ticket
+                loaded = self.jira.issue(ticket.key)
+                for i, old in enumerate(self.tickets):
+                    if getattr(old, "key", "") == ticket.key:
+                        self.tickets[i] = loaded
                         break
+                self.displayed_tickets[index] = loaded
+                ticket = loaded
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load ticket {ticket.key}: {e}")
                 return
-
         self.text_display.delete(1.0, tk.END)
         self.text_display.insert(tk.END, "Loading, please wait...", "normal")
         def fetch_details():
@@ -315,49 +359,17 @@ class JiraUI(tk.Tk):
         self.text_display.insert(tk.END, "Full Comment Conversation\n", "header")
         self.text_display.insert(tk.END, conversation, "normal")
 
-    def search_ticket_action(self):
-        if not self.jira:
-            url = self.entry_url.get().strip()
-            user = self.entry_user.get().strip()
-            token = self.entry_token.get().strip()
-            self.jira = connect_jira(url, user, token)
-            if not self.jira:
-                return
-        search_input = self.entry_search.get().strip()
-        if not search_input:
-            messagebox.showwarning("Warning", "Please enter ticket number(s) to search.")
-            return
-        results = search_tickets(self.jira, search_input)
-        if not results:
-            messagebox.showinfo("Info", "No tickets found matching the search criteria.")
-            return
-        # Merge search results with locked tickets so locked ones are preserved
-        locked_dict = {ticket.key: ticket for ticket in self.tickets if getattr(ticket, "key", "") in self.locked_tickets}
-        for ticket in results:
-            locked_dict[ticket.key] = ticket
-        merged = list(locked_dict.values())
-        non_locked = [ticket for ticket in results if ticket.key not in self.locked_tickets]
-        merged_keys = set(ticket.key for ticket in merged)
-        for ticket in non_locked:
-            if ticket.key not in merged_keys:
-                merged.append(ticket)
-        self.tickets = merged
-        self.update_ticket_list_display()
-        self.text_display.delete(1.0, tk.END)
-        self.text_display.insert(tk.END, f"Found {len(self.tickets)} ticket(s).\n", "header")
-
     def open_selected_tickets(self):
-        if not self.tickets:
-            messagebox.showwarning("Warning", "No tickets available to open.")
-            return
         selected_indices = self.ticket_list.curselection()
         if not selected_indices:
             messagebox.showwarning("Warning", "Please select at least one ticket to open.")
             return
         base_url = self.entry_url.get().strip().rstrip("/")
-        for index in selected_indices:
-            ticket_display = self.ticket_list.get(index)
-            ticket_key = ticket_display.rstrip("*")
+        for idx in selected_indices:
+            if idx < 0 or idx >= len(self.displayed_tickets):
+                continue
+            t = self.displayed_tickets[idx]
+            ticket_key = t.key.rstrip("*")
             ticket_url = f"{base_url}/browse/{ticket_key}"
             webbrowser.open_new_tab(ticket_url)
 
@@ -366,13 +378,15 @@ class JiraUI(tk.Tk):
         if not selected_indices:
             messagebox.showwarning("Warning", "Please select at least one ticket to lock/unlock.")
             return
-        for index in selected_indices:
-            ticket_display = self.ticket_list.get(index)
-            ticket_key = ticket_display.rstrip("*")
-            if ticket_key in self.locked_tickets:
-                self.locked_tickets.remove(ticket_key)
+        for idx in selected_indices:
+            if idx < 0 or idx >= len(self.displayed_tickets):
+                continue
+            t = self.displayed_tickets[idx]
+            key = t.key.rstrip("*")
+            if key in self.locked_tickets:
+                self.locked_tickets.remove(key)
             else:
-                self.locked_tickets.add(ticket_key)
+                self.locked_tickets.add(key)
         self.update_ticket_list_display()
 
     def export_selected_ticket_list(self):
@@ -385,7 +399,7 @@ class JiraUI(tk.Tk):
         date_str = now.strftime("%m-%d-%Y")
         num_tickets = len(selected_indices)
         filename = f"current-{time_str}_{date_str}_{num_tickets}_tickets.txt"
-        lines = [self.ticket_list.get(index) for index in selected_indices]
+        lines = [self.ticket_list.get(idx) for idx in selected_indices if 0 <= idx < len(self.displayed_tickets)]
         try:
             with open(filename, "w") as f:
                 for line in lines:
